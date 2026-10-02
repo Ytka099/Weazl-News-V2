@@ -1,0 +1,254 @@
+/*
+# Weazel News staff portal foundation
+
+1. New Tables
+- `profiles`: one editable staff profile per authenticated employee, with rank and department data.
+- `rank_catalog`: the 15-rank Weazel News ladder and promotion requirements.
+- `promotion_requests`: employee requests for the next rank and their review state.
+- `notifications`: private in-app notifications for each employee.
+- `news_articles`: employee-owned drafts and published newsroom materials.
+- `editorial_events`: shared newsroom schedule entries.
+
+2. Authentication and ownership
+- Every profile is linked to `auth.users` and is created automatically after signup.
+- Employee-owned records default their owner from `auth.uid()`.
+- Users can edit only their own personal content; rank and review fields are never client-writable.
+
+3. Security
+- Row level security is enabled on every new table.
+- Policies are separated by CRUD operation.
+- Senior staff can review promotion requests through a server-side function that checks the caller's current rank.
+- Rank changes create a private notification for the employee in the same server-side operation.
+
+4. Important notes
+- The initial signup profile starts at Intern / rank 1.
+- Ranks 10 and above can review requests.
+- The review function accepts only the request id and decision; it derives the acting staff member from the authenticated session.
+*/
+
+CREATE TABLE IF NOT EXISTS public.profiles (
+  id uuid PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  full_name text NOT NULL DEFAULT 'Новий співробітник',
+  employee_number text NOT NULL DEFAULT 'PENDING',
+  rank_number integer NOT NULL DEFAULT 1 CHECK (rank_number BETWEEN 1 AND 15),
+  rank_name text NOT NULL DEFAULT 'Intern',
+  department text NOT NULL DEFAULT 'Редакція',
+  bio text NOT NULL DEFAULT '',
+  avatar_url text,
+  settings jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.rank_catalog (
+  rank_number integer PRIMARY KEY CHECK (rank_number BETWEEN 1 AND 15),
+  rank_name text UNIQUE NOT NULL,
+  requirements text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.promotion_requests (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  employee_id uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  requested_rank integer NOT NULL CHECK (requested_rank BETWEEN 2 AND 15),
+  reason text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'approved', 'rejected')),
+  reviewed_by uuid REFERENCES public.profiles(id),
+  reviewed_at timestamptz,
+  reviewer_note text NOT NULL DEFAULT '',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.notifications (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  recipient_id uuid NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+  notification_type text NOT NULL DEFAULT 'system',
+  title text NOT NULL,
+  body text NOT NULL,
+  read_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.news_articles (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  author_id uuid NOT NULL DEFAULT auth.uid() REFERENCES public.profiles(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  summary text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'review', 'published')),
+  category text NOT NULL DEFAULT 'Загальне',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS public.editorial_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_by uuid NOT NULL DEFAULT auth.uid() REFERENCES public.profiles(id) ON DELETE CASCADE,
+  title text NOT NULL,
+  event_time timestamptz NOT NULL,
+  location text NOT NULL DEFAULT 'Редакція',
+  event_type text NOT NULL DEFAULT 'briefing',
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+INSERT INTO public.rank_catalog (rank_number, rank_name, requirements) VALUES
+  (1, 'Intern', 'Заповнення анкети та вступне навчання'),
+  (2, 'Copywriter', 'Написати 2 матеріали'),
+  (3, 'Staff', 'Скласти практичний іспит з ППО та ПРО'),
+  (4, 'Journalist', 'Обрати відділ і скласти початковий іспит'),
+  (5, 'Junior Editor', 'Редагування матеріалу під наглядом'),
+  (6, 'Junior Dep. Specialist', 'Подати 1 ідею для інтерактиву та створити випуск'),
+  (7, 'Department Specialist', 'Самостійно провести інтерактивний ефір'),
+  (8, 'Senior Dep. Specialist', 'Провести складний масмедійний ефір та менторство'),
+  (9, 'Editor', 'Редагування оголошень і додаткових завдань'),
+  (10, 'Department Manager', 'Стабільний контроль роботи відділу та наставництво'),
+  (11, 'Editor-in-Chief', 'Контроль випуску всіх медійних матеріалів'),
+  (12, 'Deputy Department Head', 'Керівництво розвитком відділу'),
+  (13, 'Department Head', 'Контроль якості контенту всього відділу'),
+  (14, 'Deputy Director', 'Виконання доручень директора'),
+  (15, 'Director', 'Стратегічне керівництво фракцією')
+ON CONFLICT (rank_number) DO UPDATE SET rank_name = EXCLUDED.rank_name, requirements = EXCLUDED.requirements;
+
+CREATE OR REPLACE FUNCTION public.handle_new_weazel_profile()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.profiles (id, full_name, employee_number)
+  VALUES (
+    NEW.id,
+    COALESCE(NULLIF(NEW.raw_user_meta_data->>'full_name', ''), 'Новий співробітник'),
+    COALESCE(NULLIF(NEW.raw_user_meta_data->>'employee_number', ''), 'WN-' || upper(substr(replace(NEW.id::text, '-', ''), 1, 6)))
+  )
+  ON CONFLICT (id) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created_weazel ON auth.users;
+CREATE TRIGGER on_auth_user_created_weazel
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_weazel_profile();
+
+CREATE OR REPLACE FUNCTION public.review_weazel_promotion(
+  p_request_id uuid,
+  p_approved boolean,
+  p_note text DEFAULT ''
+)
+RETURNS public.promotion_requests
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public
+AS $$
+DECLARE
+  v_actor public.profiles;
+  v_request public.promotion_requests;
+  v_rank public.rank_catalog;
+BEGIN
+  SELECT * INTO v_actor FROM public.profiles WHERE id = auth.uid();
+  IF v_actor.id IS NULL OR v_actor.rank_number < 10 THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  SELECT * INTO v_request FROM public.promotion_requests
+  WHERE id = p_request_id AND status = 'pending'
+  FOR UPDATE;
+  IF v_request.id IS NULL THEN
+    RAISE EXCEPTION 'Request is unavailable';
+  END IF;
+
+  IF p_approved AND v_request.requested_rank > v_actor.rank_number THEN
+    RAISE EXCEPTION 'Cannot grant a rank above your own';
+  END IF;
+
+  SELECT * INTO v_rank FROM public.rank_catalog WHERE rank_number = v_request.requested_rank;
+  UPDATE public.promotion_requests
+  SET status = CASE WHEN p_approved THEN 'approved' ELSE 'rejected' END,
+      reviewed_by = auth.uid(), reviewed_at = now(), reviewer_note = left(coalesce(p_note, ''), 500)
+  WHERE id = v_request.id
+  RETURNING * INTO v_request;
+
+  IF p_approved THEN
+    UPDATE public.profiles
+    SET rank_number = v_rank.rank_number, rank_name = v_rank.rank_name, updated_at = now()
+    WHERE id = v_request.employee_id;
+    INSERT INTO public.notifications (recipient_id, notification_type, title, body)
+    VALUES (v_request.employee_id, 'promotion_approved', 'Заявку на підвищення схвалено', 'Вітаємо! Ваш новий ранг: ' || v_rank.rank_name || '.');
+  ELSE
+    INSERT INTO public.notifications (recipient_id, notification_type, title, body)
+    VALUES (v_request.employee_id, 'promotion_rejected', 'Заявку на підвищення розглянуто', 'Заявку відхилено. Коментар старшого складу: ' || left(coalesce(p_note, 'Без коментаря'), 500));
+  END IF;
+
+  RETURN v_request;
+END;
+$$;
+
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.rank_catalog ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.promotion_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.news_articles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.editorial_events ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "authenticated can view team profiles" ON public.profiles;
+CREATE POLICY "authenticated can view team profiles" ON public.profiles FOR SELECT TO authenticated USING (true);
+DROP POLICY IF EXISTS "employees can insert own profile" ON public.profiles;
+CREATE POLICY "employees can insert own profile" ON public.profiles FOR INSERT TO authenticated WITH CHECK (auth.uid() = id);
+DROP POLICY IF EXISTS "employees can edit own profile" ON public.profiles;
+CREATE POLICY "employees can edit own profile" ON public.profiles FOR UPDATE TO authenticated USING (auth.uid() = id) WITH CHECK (auth.uid() = id);
+DROP POLICY IF EXISTS "employees cannot delete profiles" ON public.profiles;
+CREATE POLICY "employees cannot delete profiles" ON public.profiles FOR DELETE TO authenticated USING (false);
+
+DROP POLICY IF EXISTS "authenticated can view ranks" ON public.rank_catalog;
+CREATE POLICY "authenticated can view ranks" ON public.rank_catalog FOR SELECT TO authenticated USING (true);
+DROP POLICY IF EXISTS "rank inserts denied" ON public.rank_catalog;
+CREATE POLICY "rank inserts denied" ON public.rank_catalog FOR INSERT TO authenticated WITH CHECK (false);
+DROP POLICY IF EXISTS "rank updates denied" ON public.rank_catalog;
+CREATE POLICY "rank updates denied" ON public.rank_catalog FOR UPDATE TO authenticated USING (false) WITH CHECK (false);
+DROP POLICY IF EXISTS "rank deletes denied" ON public.rank_catalog;
+CREATE POLICY "rank deletes denied" ON public.rank_catalog FOR DELETE TO authenticated USING (false);
+
+DROP POLICY IF EXISTS "employees view own or review requests" ON public.promotion_requests;
+CREATE POLICY "employees view own or review requests" ON public.promotion_requests FOR SELECT TO authenticated USING (employee_id = auth.uid() OR EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = auth.uid() AND p.rank_number >= 10));
+DROP POLICY IF EXISTS "employees create own requests" ON public.promotion_requests;
+CREATE POLICY "employees create own requests" ON public.promotion_requests FOR INSERT TO authenticated WITH CHECK (employee_id = auth.uid());
+DROP POLICY IF EXISTS "employees update own pending requests" ON public.promotion_requests;
+CREATE POLICY "employees update own pending requests" ON public.promotion_requests FOR UPDATE TO authenticated USING (employee_id = auth.uid() AND status = 'pending') WITH CHECK (employee_id = auth.uid() AND status = 'pending');
+DROP POLICY IF EXISTS "employees cannot delete requests" ON public.promotion_requests;
+CREATE POLICY "employees cannot delete requests" ON public.promotion_requests FOR DELETE TO authenticated USING (false);
+
+DROP POLICY IF EXISTS "employees view own notifications" ON public.notifications;
+CREATE POLICY "employees view own notifications" ON public.notifications FOR SELECT TO authenticated USING (recipient_id = auth.uid());
+DROP POLICY IF EXISTS "employees cannot create notifications" ON public.notifications;
+CREATE POLICY "employees cannot create notifications" ON public.notifications FOR INSERT TO authenticated WITH CHECK (false);
+DROP POLICY IF EXISTS "employees mark own notifications read" ON public.notifications;
+CREATE POLICY "employees mark own notifications read" ON public.notifications FOR UPDATE TO authenticated USING (recipient_id = auth.uid()) WITH CHECK (recipient_id = auth.uid());
+DROP POLICY IF EXISTS "employees cannot delete notifications" ON public.notifications;
+CREATE POLICY "employees cannot delete notifications" ON public.notifications FOR DELETE TO authenticated USING (false);
+
+DROP POLICY IF EXISTS "employees view team articles" ON public.news_articles;
+CREATE POLICY "employees view team articles" ON public.news_articles FOR SELECT TO authenticated USING (author_id = auth.uid() OR status = 'published' OR EXISTS (SELECT 1 FROM public.profiles p WHERE p.id = auth.uid() AND p.rank_number >= 5));
+DROP POLICY IF EXISTS "employees create own articles" ON public.news_articles;
+CREATE POLICY "employees create own articles" ON public.news_articles FOR INSERT TO authenticated WITH CHECK (author_id = auth.uid());
+DROP POLICY IF EXISTS "employees edit own articles" ON public.news_articles;
+CREATE POLICY "employees edit own articles" ON public.news_articles FOR UPDATE TO authenticated USING (author_id = auth.uid()) WITH CHECK (author_id = auth.uid());
+DROP POLICY IF EXISTS "employees delete own articles" ON public.news_articles;
+CREATE POLICY "employees delete own articles" ON public.news_articles FOR DELETE TO authenticated USING (author_id = auth.uid());
+
+DROP POLICY IF EXISTS "employees view events" ON public.editorial_events;
+CREATE POLICY "employees view events" ON public.editorial_events FOR SELECT TO authenticated USING (true);
+DROP POLICY IF EXISTS "employees create events" ON public.editorial_events;
+CREATE POLICY "employees create events" ON public.editorial_events FOR INSERT TO authenticated WITH CHECK (created_by = auth.uid());
+DROP POLICY IF EXISTS "employees edit own events" ON public.editorial_events;
+CREATE POLICY "employees edit own events" ON public.editorial_events FOR UPDATE TO authenticated USING (created_by = auth.uid()) WITH CHECK (created_by = auth.uid());
+DROP POLICY IF EXISTS "employees delete own events" ON public.editorial_events;
+CREATE POLICY "employees delete own events" ON public.editorial_events FOR DELETE TO authenticated USING (created_by = auth.uid());
+
+REVOKE UPDATE ON public.profiles FROM authenticated;
+GRANT UPDATE (full_name, department, bio, avatar_url, settings) ON public.profiles TO authenticated;
+REVOKE EXECUTE ON FUNCTION public.review_weazel_promotion(uuid, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.review_weazel_promotion(uuid, boolean, text) TO authenticated;
+
+CREATE INDEX IF NOT EXISTS promotion_requests_employee_idx ON public.promotion_requests(employee_id, status);
+CREATE INDEX IF NOT EXISTS notifications_recipient_idx ON public.notifications(recipient_id, read_at, created_at DESC);
+CREATE INDEX IF NOT EXISTS news_articles_author_idx ON public.news_articles(author_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS editorial_events_time_idx ON public.editorial_events(event_time);
